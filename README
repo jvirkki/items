@@ -1,0 +1,4 @@
+
+'items' implements a simple terminal-friendly (curses-based) tool for
+tracking notes about a set of items. It supports adding, viewing,
+editing and deleting items.
