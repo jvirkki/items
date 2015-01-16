@@ -1,0 +1,849 @@
+#!/usr/bin/env ruby
+
+#
+#  Copyright 2014-2015 Jyri J. Virkki <jyri@virkki.com>
+#
+#  This file is part of items.
+#
+#  items is free software: you can redistribute it and/or modify it
+#  under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  items is distributed in the hope that it will be useful, but
+#  WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+#  General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with items.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+@version = '0.1'
+#
+# 'items' implements a simple terminal-friendly (curses-based) tool
+# for tracking notes about a set of items. It supports adding,
+# viewing, editing and deleting items.
+#
+# The data is stored in an SQLite database file. Implementation
+# convenience aside, this has the benefit that it is easy to interact
+# with the data set in more advanced ways not supported by this
+# script alone.
+#
+# The schema must conform to the conventions described in the Schema
+# section below.
+#
+#
+# Schema
+# ======
+#
+# The schema must be manually created before running items.  Run
+# 'sqlite3 filename'. At a minimum the 'items' table must be created
+# to define what info you want to track.  Optionally, create the other
+# tables listed below for a better experience.
+#
+# 'items'
+# -------
+# There must be a table called 'items' to hold the notes on each item.
+#
+# The items table must have a column 'id' which is the primary key.
+# Apart from id, every other column in this table is assumed to be a
+# field the user will enter when adding an item. Currently only TEXT,
+# REAL and INTEGER types are supported by this code. The script will
+# read the schema on startup to discover what fields to present.
+#
+# There is no limit to how many info columns the items table may
+# have. However, in practice too many columns will be unwieldy.
+# Somewhere around ten is likely a practial limit, although it depends
+# on how many are text vs. numbers and how wide each needs to be.
+#
+# Here is a sample which creates a minimal set of items where each
+# only has a name and a rating:
+#
+# CREATE TABLE items (id INTEGER PRIMARY KEY,
+#                     name TEXT,
+#                     rating INTEGER);
+#
+# 'descriptions'
+# --------------
+# An optional (recommended) table descriptions can be present to
+# improve the field names presented to the user. It must have the
+# following schema:
+#
+# CREATE TABLE descriptions (name STRING PRIMARY KEY, description TEXT);
+#
+# Each name corresponds to items.name and the description is a longer
+# human readable description of this field. Not every items.name must
+# be present in descriptions. If missing, capitalized items.name is
+# used as the description.
+#
+# 'meta'
+# ------
+# An optional (recommended) table with meta info about this item set.
+#
+# CREATE TABLE meta (dbname TEXT)
+#   dbname - Short description of what this db is about. Shown on
+#            the status line so should be fairly short.
+#
+
+require 'sqlite3'
+require 'curses'
+require 'pathname'
+include Curses
+
+#
+# Container for each row in the items table
+#
+class Field
+  attr_accessor :name, :description, :type, :optional, :value
+  attr_accessor :width, :longest, :minwidth, :maxwidth
+  def to_s
+    "#{@name} (#{@description}) #{@type}: #{@value}"
+  end
+end
+
+#
+# Check the sqlite3 schema (see schema documentation above) to
+# discover what fields this items database supports.
+#
+# db - sqlite3 database connection
+#
+# Returns an Array of Field objects populated by looking at the schema.
+#
+def sql_study_schema(db)
+
+  items = Array.new()
+
+  db.execute("pragma table_info(items)") { |row|
+
+    if (row['name'] != 'id') # 'id' is special, see docs above
+      f = Field.new()
+      f.name = row['name']
+      f.description = f.name.capitalize
+      f.type = row['type']
+      f.optional = true if (0 == row['notnull'])
+
+      # Check if a description is available for this field
+      begin
+        sql = "SELECT description FROM descriptions WHERE name='#{f.name}'"
+        db.execute(sql) { |desc|
+          f.description = desc['description']
+        }
+      rescue
+      end
+
+      # Given current data, find the widest entry for this field
+      if (f.type == 'TEXT')
+        sql = "SELECT MAX(LENGTH(#{f.name})) AS n FROM items";
+        db.execute(sql) { |n|
+          f.longest = n['n'].to_i
+          f.minwidth = 2
+          f.maxwidth = [f.longest, f.description.length].max
+        }
+      elsif (f.type == 'INTEGER')
+        sql = "SELECT MAX(#{f.name}) AS n FROM items";
+        db.execute(sql) { |n|
+          f.longest = n['n'].to_s.length
+          f.minwidth = f.longest
+          f.maxwidth = [f.longest, f.description.length].max
+        }
+      elsif (f.type == 'REAL')
+        sql = "SELECT MAX(#{f.name}) AS n FROM items";
+        db.execute(sql) { |n|
+          f.longest = n['n'].to_s.length + 3
+          f.minwidth = f.longest
+          f.maxwidth = [f.longest, f.description.length].max
+        }
+      else
+        close_screen()
+        puts "error: unsupported type #{f.type} found in items!"
+        exit(1)
+      end
+
+      items.push(f)
+    end
+  }
+
+  begin
+    sql = "SELECT dbname FROM meta";
+    db.execute(sql) { |name|
+      @dbname = name['dbname']
+    }
+  rescue
+  end
+
+  items
+end
+
+#
+# Check how many items are in the sqlite3 database.
+#
+# db - sqlite3 database connection
+#
+# Returns the current count of items in the sqlite3 database.
+#
+def sql_item_count(db)
+  db.execute("SELECT COUNT(*) AS 'N' FROM items") { |n|
+    return n['N'].to_i
+  }
+end
+
+#
+# Bind every field in items, in order, to a prepared statement.
+#
+# items     - Array of Field objects, the value is expected to be set
+# statement - Prepared statment to use
+#
+def sql_bind_all_items(items, statement)
+
+  items.each_index { |i|
+    if (items[i].type == 'TEXT')
+      statement.bind_param(i+1, items[i].value)
+    elsif (items[i].type == 'INTEGER')
+      statement.bind_param(i+1, items[i].value.to_i)
+    elsif (items[i].type == 'REAL')
+      statement.bind_param(i+1, items[i].value.to_f)
+    end
+  }
+end
+
+#
+# Build and execute a prepared statement to add a new item.
+#
+# db    - sqlite3 database connection
+# items - Array of Field objects, the value is expected to be set
+#
+def sql_prepare_add(db, items)
+
+  names = "("
+  values = "VALUES ("
+  comma = ''
+  items.each_index { |i|
+    names = names + "#{comma}#{items[i].name}"
+    values = values + "#{comma}?"
+    comma = ', '
+  }
+  sql = "INSERT INTO items #{names}) #{values})"
+  stmt = db.prepare(sql)
+  sql_bind_all_items(items, stmt)
+  stmt.execute()
+  stmt.close()
+end
+
+#
+# Build and execute a prepared statement to modify an item.
+#
+# db    - sqlite3 database connection
+# items - Array of Field objects, the value is expected to be set
+# id    - The id of this item (table key in sqlite items table)
+#
+def sql_prepare_modify(db, items, id)
+
+  changes = ''
+  comma = ''
+  items.each_index { |i|
+    changes = changes + "#{comma}#{items[i].name}=?"
+    comma = ', '
+  }
+  sql = "UPDATE items SET #{changes} WHERE id=#{id}"
+  stmt = db.prepare(sql)
+  sql_bind_all_items(items, stmt)
+  stmt.execute()
+  stmt.close()
+end
+
+#
+# Populate the values for each field in items from the database.
+#
+# db    - sqlite3 database connection
+# items - Array of Field objects, the values will be set (as Strings)
+# id    - The id of this item (table key in sqlite items table)
+#
+def sql_populate_item_from_db(db, items, id)
+
+  db.execute("SELECT * FROM items WHERE id=#{id}") { |item|
+    items.each_index { |n|
+      items[n].value = item[items[n].name].to_s
+    }
+  }
+end
+
+#
+# Delete an item in the items database.
+#
+# db    - sqlite3 database connection
+# id    - The id of this item (table key in sqlite items table)
+#
+def sql_delete_item(db, id)
+  db.execute("DELETE FROM items WHERE id=#{id}")
+end
+
+#
+# Do some validation on the value of an item to warn user.
+#
+# For an item of type TEXT, nothing is done.
+# For an item of type INTEGER, display a warning on the right edge of the line
+# if the value string does not convert to an integer without data loss.
+#
+# items   - Array of Field objects, the value is expected to be set.
+# item    - Validate this entry in items.
+# longest - Length of longest description in items (for UI alignment)
+#
+def validate_field(items, item, longest)
+
+  if (items[item].type == 'TEXT')
+    return
+  end
+
+  if (items[item].type == 'INTEGER')
+    v = items[item].value
+    vi = v.to_i
+    vis = vi.to_s
+    if (v != vis)
+      msg = "INTEGER: Using: #{v.to_i}"
+      setpos(item + 2, cols - 2 - msg.length)
+      addstr(msg)
+      setpos(item + 2, longest + 2 + v.length)
+      refresh()
+    else                        # clear any possible previous warning
+      setpos(item + 2, longest + 2 + v.length)
+      addstr(" " * (cols - (longest + 2 + v.length)))
+      setpos(item + 2, longest + 2 + v.length)
+      refresh()
+    end
+  end
+end
+
+#
+# Add a new item to the items database.
+#
+# db    - sqlite3 database connection
+# items - Array of Field objects, created earlier by sql_study_schema()
+#
+def add_new_item(db, items)
+
+  items.each_index { |i|
+    items[i].value = ''
+  }
+
+  entry_ui(db, items)
+
+  setpos(items.length + 3, 0)
+  addstr("Add this item now? ")
+  refresh()
+  ch = getch()
+  sql = sql_prepare_add(db, items) if (ch.downcase == 'y')
+  clear()
+end
+
+#
+# Edit an item in the items database.
+#
+# db    - sqlite3 database connection
+# items - Array of Field objects, contains the values to edit.
+# id    - The id of this item (table key in sqlite items table)
+#
+def edit_item(db, items, id)
+
+  entry_ui(db, items)
+
+  setpos(items.length + 3, 0)
+  addstr("Save these changes? ")
+  refresh()
+  ch = getch()
+  sql = sql_prepare_modify(db, items, id) if (ch.downcase == 'y')
+  clear()
+end
+
+#
+# Delete an item in the items database, asking for confirmation from user.
+#
+# db    - sqlite3 database connection
+# items - Array of Field objects, contains the values to edit.
+# id    - The id of this item (table key in sqlite items table)
+#
+def delete_item(db, items, id)
+
+  show_item_table(db, items)
+  setpos(items.length+2, 0)
+  attron(A_REVERSE)
+  msg = "Are you sure you want to delete this item ('Y' to delete)"
+  addstr(msg + " " * (cols - msg.length - 1))
+  attroff(A_REVERSE)
+  refresh()
+
+  ch = getch()
+  sql = sql_delete_item(db, id) if (ch == 'Y')
+  clear()
+end
+
+#
+# Display screen showing heading and all items, with values if present.
+#
+# db    - sqlite3 database connection
+# items - Array of Field objects, contains the values to edit.
+#
+# Returns length of longest description.
+#
+def show_item_table(db, items)
+
+  clear()
+  draw_header(db, -1)
+
+  # Figure out the longest description so we can align the UI below.
+  longest = 1
+  items.each_index { |i|
+    name = items[i].description
+    longest = name.length if (name.length > longest)
+  }
+
+  # Present the entry fields, one line for each name in the item.
+  items.each_index { |i|
+    setpos(2+i, 0)
+    name = items[i].description
+    addstr("#{name}:")
+    addstr(" " * (longest + 1 - name.length))
+    addstr(items[i].value)
+  }
+  refresh()
+
+  longest
+end
+
+#
+# Handle UI for item data entry and editing. Don't call directly.
+#
+# db    - sqlite3 database connection
+# items - Array of Field objects, contains the values to edit.
+#
+def entry_ui(db, items)
+
+  longest = show_item_table(db, items)
+  setpos(items.length+2, 0)
+  attron(A_REVERSE)
+  msg = "Press C-x to finish editing the fields"
+  addstr(msg + " " * (cols - msg.length - 1))
+  attroff(A_REVERSE)
+  done = false
+  item = 0
+  setpos(item + 2, longest + 2 + items[0].value.length)
+  curs_set(1)
+  refresh()
+
+  # Main UI loop here. Get user input, save entered text and move around.
+  # User exits by entering C-x
+
+  loop do
+
+    ch = getch()
+    chi = ch.to_i
+
+    if (ch.class == String)     # else, it is a Fixnum
+      addstr(ch)
+      items[item].value = items[item].value + ch
+    elsif (ch == Key::DOWN || ch == Key::ENTER || chi == 10 || chi == 9)
+      validate_field(items, item, longest)
+      item = item + 1
+    elsif (ch == Key::UP)
+      validate_field(items, item, longest)
+      item = item - 1
+    elsif (chi == 263 || chi == 127 || ch == Key::BACKSPACE || ch == Key::DC)
+      items[item].value = items[item].value[0..-2]
+      setpos(item + 2, longest + 2 + items[item].value.length)
+      addstr(" ")
+    elsif (chi == 24)           # C-x
+      validate_field(items, item, longest)
+      done = true
+    else
+      addstr("got ch #{ch} int: #{chi}")
+    end
+
+    # Wrap around if scrolling beyond top or bottom of items
+    if (item >= items.length)
+      item = 0
+    elsif (item < 0)
+      item = items.length - 1
+    end
+
+    setpos(item + 2, longest + 2 + items[item].value.length)
+    refresh()
+
+    break if (done)
+  end
+end
+
+#
+# Draw a reverse video header line at the top of the screen.
+#
+# db  - sqlite3 database connection
+# row - data row being highlighted, or -1 if none
+#
+def draw_header(db, row)
+  total_items = sql_item_count(db)
+  setpos(0,0)
+  attron(A_REVERSE)
+  line = "items"
+  line = line + ": #{@dbname}" if (@dbname != nil)
+  line = line + " | <a>dd new item | <q>uit | "
+  line = line + "<d>elete | <enter> to edit | " if row >= 0
+  line = line + "total items: #{total_items}"
+  line = line + " " * (cols - line.length) if (line.length < cols)
+  addstr(line[0,cols-1])
+  attroff(A_REVERSE)
+  refresh()
+end
+
+#
+# Figure out how much space we can give each column given screen width.
+# Note this is computed every time to support screen resizing.
+#
+# For integer values the largest value present determines the minimum
+# column width to avoid misleading by cropping off some digits.
+# For string values the size may be reduced to limit display size.
+#
+# If all the fields still don't fit, columns are dropped starting from
+# the last one (in schema order) until the remaining set fits.
+#
+# The 'width' attribute of the Field objects in items is updated to
+# the assigned width. If it is zero, that field didn't fit the screen.
+#
+# items - Array of Field objects, created earlier by sql_study_schema()
+#
+def check_widths(items)
+
+  # Start by giving minimum to every column
+  len = 0
+  items.each_index { |n|
+    len = len + 2 + items[n].minwidth
+    items[n].width = items[n].minwidth
+  }
+
+  # If not even that fits, drop columns until we fit
+  if (len >= cols)
+    drop = items.length - 1
+    loop do
+      len = len - items[drop].width
+      items[drop].width = 0
+      drop = drop - 1
+      break if (drop == -1 || len < cols-1)
+    end
+    return
+  end
+
+  # All right, didn't need to drop anyone! Let's give them more space
+  # so we use the whole line.
+  loop do
+    perfect = true
+    items.each_index { |n|
+      if (items[n].width < items[n].maxwidth)
+        perfect = false
+        inc = (items[n].maxwidth - items[n].width) / items.length
+        if (inc < 1)
+          inc = 1
+        else
+          if (inc > cols - len - 1)
+            inc = cols - len - 1
+          end
+        end
+        items[n].width = items[n].width + inc
+        len = len + inc
+      end
+      return if (len == cols - 1)
+    }
+    break if perfect
+  end
+
+end
+
+#
+# Display the column headers based on the width and inclusion
+# decisions computed by check_widths()
+#
+# items   - Array of Field objects, width attributes updated by check_widths()
+# orderby - Index of the field we're sorting on, to highlight it
+#
+# Returns a string with the column headers.
+#
+def show_items_header(items, orderby)
+
+  line = ''
+  items.each_index { |n|
+    width = items[n].width
+    if (width > 0)
+      fmt = " %-#{width}s "
+      attron(A_STANDOUT) if (n == orderby)
+      s = sprintf(fmt, items[n].description[0,width])
+      addstr(s)
+      line = line + s
+      attroff(A_STANDOUT) if (n == orderby)
+    end
+  }
+  line
+end
+
+#
+# Produce a string containing a display row for one item, with column
+# widths and inclusion based on decisions computed by check_widths()
+#
+# items    - Array of Field objects, width attributes updated by check_widths()
+# itemhash - The item to display. This is a Hash returned by sqlite3 select.
+#
+# Returns a string with the row data.
+#
+def item_line(items, itemhash)
+
+  line = ""
+
+  items.each_index { |n|
+
+    width = items[n].width
+
+    if (items[n].type == 'TEXT')
+      fmt = " %-#{width}s "
+      s = sprintf(fmt, itemhash[items[n].name][0,width])
+    elsif (items[n].type == 'INTEGER')
+      fmt = " %#{width}d "
+      s = sprintf(fmt, itemhash[items[n].name])
+    elsif (items[n].type == 'REAL')
+      fmt = " %#{width}.2f "
+      s = sprintf(fmt, itemhash[items[n].name])
+    end
+    line = line + s
+  }
+
+  line
+end
+
+#
+# Show the list of items from the database, limited to what fits on
+# the current screen.
+#
+# db      - sqlite3 database connection
+# items   - Array of Field objects, created earlier by sql_study_schema()
+# orderby - Index of the field to sort on
+# row     - Data row to highlight (if <0, highlight none)
+# sort    - sort order: ASC or DESC
+#
+# Returns (the number of items displayed, the id of the row entry)
+#
+def show_items(items, db, orderby, row, sort)
+
+  curs_set(0)
+  check_widths(items)
+  setpos(2,0)
+  show_items_header(items, orderby)
+  setpos(3,0)
+  addstr("-" * (cols-1))
+
+  count = 0
+  line = 4
+  row_id = -1
+
+  sql = "SELECT * FROM items ORDER BY #{items[orderby].name} #{sort}"
+  db.execute(sql) { |item|
+    setpos(line, 0)
+    msg = item_line(items, item)
+    if (count == row)
+      attron(A_STANDOUT)
+      row_id = item['id'].to_i
+    end
+    addstr(msg)
+    attroff(A_STANDOUT) if (count == row)
+    line = line + 1
+    count = count + 1
+    break if line == lines      # if we reached bottom of available screen
+  }
+  refresh()
+
+  return count, row_id
+end
+
+#
+# Produce the full list of items for display.
+#
+# db      - sqlite3 database connection
+# items   - Array of Field objects, created earlier by sql_study_schema()
+#
+# Returns an Array where each element is a line to output.
+#
+def list_items(db, items)
+
+  orderby = 0
+  line = 0
+  out = Array.new()
+  check_widths(items)
+  out[line] = show_items_header(items, orderby)
+  out[line + 1] = "-" * (cols-1)
+  line = line + 2
+
+  db.execute("SELECT * FROM items ORDER BY #{items[orderby].name}") { |item|
+    msg = item_line(items, item)
+    out[line] = msg
+    line = line + 1
+  }
+
+  out
+end
+
+#
+# Show usage help and exit.
+#
+def usage
+
+  p = File.expand_path(File.join(File.dirname(__FILE__))) + "/#{__FILE__}"
+  me = Pathname.new(p).cleanpath
+
+  puts "items provides a simple curses-based tool to maintain notes about"
+  puts "a set of items. For more info read the documentation in the file:"
+  puts "#{me}"
+  puts
+  puts "  -h        Show this help message and exit"
+  puts "  -l        List content of database file to stdout and exit"
+  puts "  -f FILE   Use FILE as the items database file"
+  puts "  --version Show version and exit"
+  exit(0)
+end
+
+#
+# Process command line arguments
+#
+# Returns a Hash which may contain keys:
+#  list - true if present
+#  file - Name of file to use as the database
+#
+def process_args()
+
+  args = Hash.new()
+  pos = 0
+  while (pos < ARGV.length)
+    if (ARGV[pos] == '-l')
+      args['list'] = true
+    elsif (ARGV[pos] == '-h')
+      usage()
+    elsif (ARGV[pos] == '-f')
+      args['file'] = ARGV[pos + 1]
+      pos = pos + 1
+    elsif (ARGV[pos] = '--version')
+      puts @version
+      exit(0)
+    else
+      puts "Ignoring unknown argument #{ARGV[pos]}"
+    end
+    pos = pos + 1
+  end
+
+  args
+end
+
+#
+# Returns name of database file to use.
+# If the name was given in the command line arguments, use that.
+# Otherwise, if there is a suitable .items file available, use that.
+#
+def file_to_use(args)
+
+  file = args['file']
+  if (file != nil)
+    if (File.file?(file))
+      return file
+    else
+      puts "error: file #{file} does not exist!"
+      exit(1)
+    end
+  end
+
+  ls = `ls -1 *.items 2>/dev/null`
+  files = ls.split(/\n/)
+  if (files.length == 1)
+    if (File.file?(files[0]) && File.readable?(files[0]))
+      return files[0]
+    else
+      puts "error: unsuitable file #{files[0]}"
+      exit(1)
+    end
+  elsif (files.length > 1)
+    puts "error: multiple .items files, specify desired one with -f"
+    exit(1)
+  end
+
+  puts "error: no suitable items file found!"
+  exit(1)
+end
+
+#==============================================================================
+# main()
+#
+
+begin
+
+  args = process_args()
+
+  database_file = file_to_use(args)
+  db = SQLite3::Database.new(database_file)
+  db.results_as_hash = true
+
+  items = sql_study_schema(db)
+  if (items.length < 1)
+    puts "error: no items found in database #{database_file}"
+    exit(1)
+  end
+
+  init_screen()
+  noecho()
+  curs_set(0)                   # don't display cursor
+  cbreak()                      # read every keystroke directly
+  stdscr.keypad = true          # don't ignore arrow keys, etc.
+  orderby = 0
+  row = -1
+  sort = 'ASC'
+
+  if (items.length + 4 > lines)
+    close_screen()
+    puts "error: screen needs at least #{items.length + 4} lines"
+    exit(1)
+  end
+
+  if (args['list'])
+    out = list_items(db, items)
+    close_screen()
+    out.each { |line| puts line }
+    exit(0)
+  end
+
+  while(true)
+    draw_header(db, row)
+    item_count, row_id = show_items(items, db, orderby, row, sort)
+
+    key = getch()
+    if (key == 'a')
+      add_new_item(db, items)
+    elsif (key == ' ')
+      sort = sort == 'ASC' ? 'DESC' : 'ASC'
+    elsif (key == 'q')
+      exit(0)
+    elsif (key == 'd')
+      sql_populate_item_from_db(db, items, row_id)
+      delete_item(db, items, row_id)
+    elsif (key == Key::LEFT)
+      orderby = orderby - 1
+      orderby = items.length - 1 if (orderby < 0)
+    elsif (key == Key::RIGHT)
+      orderby = orderby + 1
+      orderby = 0 if (orderby >= items.length)
+    elsif (key == Key::DOWN || key == 'j')
+      row = row + 1
+      row = 0 if (row >= item_count)
+    elsif (key == Key::UP || key == 'k')
+      row = row - 1
+      row = -1 if (row < -1)
+    elsif (row_id >= 0 && (key == Key::ENTER || key.to_i == 10))
+      sql_populate_item_from_db(db, items, row_id)
+      edit_item(db, items, row_id)
+    end
+
+  end
+
+ensure
+  close_screen()
+  db.close() if db != nil
+end
